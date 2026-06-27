@@ -1,0 +1,25 @@
+# Run from the repository root so the relative file paths below resolve.
+
+option name rc
+option token secret
+option log-dir examples/logs
+option cert examples/certs/server.crt
+option key examples/certs/server.key
+option ca examples/certs/ca.crt
+option agents-file examples/agents.txt
+
+stage prepare single
+task prepare -- /bin/sh -c "echo preparing remote batch; wc -c shared-note.txt"
+shared file examples/data/shared-note.txt
+end
+
+stage shard parallel
+task shard-a -- /bin/sh -c "echo shard A; wc -l input.txt.part0; cat input.txt.part0"
+task shard-b -- /bin/sh -c "echo shard B; wc -l input.txt.part1; cat input.txt.part1"
+task shard-c -- /bin/sh -c "echo shard C; wc -l input.txt.part2; cat input.txt.part2"
+split file examples/data/input.txt
+end
+
+stage finalize single
+task finalize -- /bin/sh -c "echo all remote work finished"
+end

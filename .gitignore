@@ -1,0 +1,6 @@
+bin/
+build/
+examples/logs/
+examples/logs-local/
+examples/logs-queue/
+examples/certs/
