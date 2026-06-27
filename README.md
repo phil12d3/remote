@@ -2,6 +2,62 @@
 
 `remote` is a two-binary C++ tool for running command batches across remote machines.
 
+## Getting Started
+
+Build the project from the repository root:
+
+```bash
+make
+```
+
+That produces:
+
+- `bin/rc`
+- `bin/rc-agent`
+
+To remove build outputs:
+
+```bash
+make clean
+```
+
+You can override the compiler or flags if needed:
+
+```bash
+make CXX=clang++ CXXFLAGS="-std=c++17 -O2 -Wall -Wextra -pedantic"
+```
+
+For a local demo:
+
+1. Generate the development certificates.
+
+   ```bash
+   ./examples/make-dev-certs.sh
+   ```
+
+2. Start three agents in separate terminals.
+
+   ```bash
+   ./bin/rc-agent --port 19001 --cert examples/certs/server.crt --key examples/certs/server.key --ca examples/certs/ca.crt --token secret --name node1
+   ./bin/rc-agent --port 19002 --cert examples/certs/server.crt --key examples/certs/server.key --ca examples/certs/ca.crt --token secret --name node2
+   ./bin/rc-agent --port 19003 --cert examples/certs/server.crt --key examples/certs/server.key --ca examples/certs/ca.crt --token secret --name node3
+   ```
+
+3. Start the controller from the repository root.
+
+   ```bash
+   ./bin/rc --plan examples/demo.plan
+   ```
+
+For plaintext development only, use `--no-cert` on both binaries:
+
+```bash
+./bin/rc-agent --no-cert --port 19001 --token secret --name node1
+./bin/rc-agent --no-cert --port 19002 --token secret --name node2
+./bin/rc-agent --no-cert --port 19003 --token secret --name node3
+./bin/rc --no-cert --plan examples/demo.plan
+```
+
 ## Components
 
 - `rc` is the controller. It connects to agents over TLS by default, schedules stages, pushes file payloads, streams logs, and exposes live controls on stdin.
@@ -108,12 +164,6 @@ While the controller is running, stdin commands are available:
 - `resume <node>` sends SIGCONT
 - `kill <node>` sends SIGTERM
 
-## Build
-
-```bash
-make
-```
-
 ## Local TLS Setup
 
 For a local demo, generate a CA and controller cert/key:
@@ -160,13 +210,6 @@ The controller reads the agent list from `examples/agents.txt` through the plan.
 You can also supply `--agents-file <path>` on `rc` to override the plan at runtime.
 
 Plaintext dev-only mode:
-
-```bash
-./bin/rc-agent --no-cert --port 19001 --token secret --name node1
-./bin/rc-agent --no-cert --port 19002 --token secret --name node2
-./bin/rc-agent --no-cert --port 19003 --token secret --name node3
-./bin/rc --no-cert --plan examples/demo.plan
-```
 
 ## Common Failure Modes
 
