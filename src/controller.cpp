@@ -5,6 +5,7 @@
 #include <deque>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <thread>
 
@@ -73,6 +74,79 @@ std::vector<AgentEndpoint> load_agents_file(const std::filesystem::path &path) {
       throw std::runtime_error("each agents file line must contain a single host:port entry");
     }
     endpoints.push_back(parse_endpoint(tokens[0]));
+  }
+  return endpoints;
+}
+
+std::vector<AgentEndpoint> resolve_agent_pool(const AgentPoolSpec &pool) {
+  std::vector<AgentEndpoint> endpoints;
+  std::set<std::string> seen;
+
+  if (pool.agents_file) {
+    for (const auto &endpoint : load_agents_file(*pool.agents_file)) {
+      std::string key = endpoint.host + ":" + std::to_string(endpoint.port);
+      if (seen.insert(key).second) {
+        endpoints.push_back(endpoint);
+      }
+    }
+  }
+
+  for (const auto &text : pool.agents) {
+    AgentEndpoint endpoint = parse_endpoint(text);
+    std::string key = endpoint.host + ":" + std::to_string(endpoint.port);
+    if (seen.insert(key).second) {
+      endpoints.push_back(endpoint);
+    }
+  }
+
+  return endpoints;
+}
+
+std::set<std::string> endpoint_keys(const std::vector<AgentEndpoint> &endpoints) {
+  std::set<std::string> keys;
+  for (const auto &endpoint : endpoints) {
+    keys.insert(endpoint.host + ":" + std::to_string(endpoint.port));
+  }
+  return keys;
+}
+
+AgentPoolSpec resolve_default_pool(const PlanSpec &plan,
+                                  const std::optional<std::string> &cli_agents_file,
+                                  const std::vector<AgentEndpoint> &cli_endpoints) {
+  AgentPoolSpec pool;
+  if (cli_agents_file) {
+    pool.agents_file = *cli_agents_file;
+  } else if (plan.options.agents_file) {
+    pool.agents_file = *plan.options.agents_file;
+  }
+
+  for (const auto &endpoint_text : plan.options.agents) {
+    pool.agents.push_back(endpoint_text);
+  }
+  for (const auto &endpoint : cli_endpoints) {
+    pool.agents.push_back(endpoint.host + ":" + std::to_string(endpoint.port));
+  }
+  return pool;
+}
+
+std::vector<AgentEndpoint> collect_required_endpoints(const PlanSpec &plan, const AgentPoolSpec &default_pool) {
+  std::vector<AgentEndpoint> endpoints;
+  std::set<std::string> seen;
+  auto add_pool = [&](const AgentPoolSpec &pool) {
+    for (const auto &endpoint : resolve_agent_pool(pool)) {
+      std::string key = endpoint.host + ":" + std::to_string(endpoint.port);
+      if (seen.insert(key).second) {
+        endpoints.push_back(endpoint);
+      }
+    }
+  };
+
+  add_pool(default_pool);
+  for (const auto &workflow : plan.workflows) {
+    add_pool(workflow.agent_pool);
+    for (const auto &substage : workflow.substages) {
+      add_pool(substage.agent_pool);
+    }
   }
   return endpoints;
 }
@@ -234,16 +308,17 @@ void node_reader(ControllerState &state, std::shared_ptr<NodeSession> node) {
 }
 
 void send_task_payloads(NodeSession &node,
-                        const StageSpec &stage,
+                        const std::string &stage_name,
+                        const SubstageSpec &substage,
                         const TaskSpec &task,
                         std::size_t task_index) {
-  for (const auto &shared_file : stage.shared_files) {
+  for (const auto &shared_file : substage.shared_files) {
     auto data = read_binary_file(shared_file);
-    send_message(node, "UPLOAD", {stage.name, task.name, basename_string(shared_file), base64_encode(data)});
+    send_message(node, "UPLOAD", {stage_name, task.name, basename_string(shared_file), base64_encode(data)});
   }
-  if (stage.has_split_file) {
-    auto rows = read_text_rows(stage.split_file);
-    std::size_t total = stage.tasks.size();
+  if (substage.has_split_file) {
+    auto rows = read_text_rows(substage.split_file);
+    std::size_t total = substage.tasks.size();
     std::size_t base = rows.size() / total;
     std::size_t remainder = rows.size() % total;
     std::size_t begin = task_index * base + std::min(task_index, remainder);
@@ -255,40 +330,9 @@ void send_task_payloads(NodeSession &node,
     std::vector<unsigned char> shard_bytes(shard.begin(), shard.end());
     send_message(node,
                  "UPLOAD",
-                 {stage.name, task.name, basename_string(stage.split_file) + ".part" + std::to_string(task_index),
+                 {stage_name, task.name, basename_string(substage.split_file) + ".part" + std::to_string(task_index),
                   base64_encode(shard_bytes)});
   }
-}
-
-void dispatch_queue_job(NodeSession &node,
-                        const std::string &stage_name,
-                        const TaskSpec &task,
-                        const std::filesystem::path &source_file,
-                        std::size_t job_index) {
-  std::string job_name = sanitize_name(task.name + "-" + std::to_string(job_index) + "-" + basename_string(source_file));
-  std::string remote_name = basename_string(source_file);
-  std::vector<std::pair<std::string, std::vector<unsigned char>>> uploads;
-  uploads.push_back({remote_name, read_binary_file(source_file)});
-  std::vector<std::string> argv = task.argv;
-  argv.push_back(remote_name);
-  std::string workdir = stage_name + "/" + job_name;
-  dispatch_task(node, stage_name, job_name, workdir, argv, uploads);
-}
-
-bool wait_for_idle_node(ControllerState &state) {
-  std::unique_lock<std::mutex> lock(state.mutex);
-  state.cv.wait(lock, [&] {
-    if (state.stage_failed) {
-      return true;
-    }
-    for (const auto &entry : state.nodes) {
-      if (entry.second->authenticated && entry.second->connected && !entry.second->busy) {
-        return true;
-      }
-    }
-    return false;
-  });
-  return !state.stage_failed;
 }
 
 void interactive_loop(ControllerState &state) {
@@ -336,142 +380,209 @@ void interactive_loop(ControllerState &state) {
   }
 }
 
-std::shared_ptr<NodeSession> pick_idle_node(ControllerState &state) {
+bool node_allowed(const NodeSession &node,
+                  const std::set<std::string> *allowed_endpoints,
+                  const std::optional<std::string> &pinned_agent) {
+  if (pinned_agent) {
+    return node.name == *pinned_agent && node.authenticated && node.connected && !node.busy;
+  }
+  if (allowed_endpoints != nullptr && !allowed_endpoints->empty() && allowed_endpoints->count(node.endpoint) == 0) {
+    return false;
+  }
+  return node.authenticated && node.connected && !node.busy;
+}
+
+std::shared_ptr<NodeSession> pick_idle_node(ControllerState &state,
+                                            const std::set<std::string> *allowed_endpoints,
+                                            const std::optional<std::string> &pinned_agent) {
   for (auto &[name, node] : state.nodes) {
-    if (node->authenticated && node->connected && !node->busy) {
+    if (node_allowed(*node, allowed_endpoints, pinned_agent)) {
       return node;
     }
   }
   return nullptr;
 }
 
-void run_fixed_parallel_stage(ControllerState &state, const StageSpec &stage) {
+bool has_any_busy_node(ControllerState &state, const std::set<std::string> *allowed_endpoints) {
+  for (const auto &[name, node] : state.nodes) {
+    if (!node->authenticated || !node->connected || !node->busy) {
+      continue;
+    }
+    if (allowed_endpoints != nullptr && !allowed_endpoints->empty() && allowed_endpoints->count(node->endpoint) == 0) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+struct WorkItem {
+  std::string task_name;
+  std::string stage_name;
+  std::string workdir;
+  std::vector<std::string> argv;
+  std::optional<std::string> agent_name;
+  std::vector<std::pair<std::string, std::vector<unsigned char>>> uploads;
+  std::size_t task_index = 0;
+  bool queue_job = false;
+};
+
+std::string stage_scope_name(const std::string &workflow_name, const std::string &substage_name) {
+  return workflow_name + "/" + substage_name;
+}
+
+std::vector<WorkItem> build_work_items(const WorkflowSpec &workflow, const SubstageSpec &substage) {
+  std::vector<WorkItem> items;
+  if (substage.kind == SubstageKind::kQueue) {
+    const auto &task = substage.tasks.front();
+    for (std::size_t i = 0; i < substage.queue_files.size(); ++i) {
+      const auto &source_file = substage.queue_files[i];
+      WorkItem item;
+      item.queue_job = true;
+      item.task_index = i;
+      item.task_name = sanitize_name(task.name + "-" + std::to_string(i) + "-" + basename_string(source_file));
+      item.stage_name = stage_scope_name(workflow.name, substage.name);
+      item.workdir = workflow.name + "/" + substage.name + "/" + item.task_name;
+      item.argv = task.argv;
+      item.argv.push_back(basename_string(source_file));
+      item.agent_name = task.agent_name;
+      item.uploads.push_back({basename_string(source_file), read_binary_file(source_file)});
+      items.push_back(std::move(item));
+    }
+    return items;
+  }
+
+  for (std::size_t i = 0; i < substage.tasks.size(); ++i) {
+    const auto &task = substage.tasks[i];
+    WorkItem item;
+    item.task_index = i;
+    item.task_name = task.name;
+    item.stage_name = stage_scope_name(workflow.name, substage.name);
+    item.workdir = task.workdir;
+    item.argv = task.argv;
+    item.agent_name = task.agent_name;
+    items.push_back(std::move(item));
+  }
+  return items;
+}
+
+bool dispatch_work_item(const SubstageSpec &substage,
+                        const WorkItem &item,
+                        const std::shared_ptr<NodeSession> &node) {
+  if (substage.kind == SubstageKind::kQueue) {
+    for (const auto &shared_file : substage.shared_files) {
+      auto data = read_binary_file(shared_file);
+      send_message(*node, "UPLOAD", {item.stage_name, item.task_name, basename_string(shared_file), base64_encode(data)});
+    }
+    for (const auto &upload : item.uploads) {
+      send_message(*node, "UPLOAD", {item.stage_name, item.task_name, upload.first, base64_encode(upload.second)});
+    }
+  } else {
+    send_task_payloads(*node, item.stage_name, substage, substage.tasks[item.task_index], item.task_index);
+  }
+
+  if (substage.kind == SubstageKind::kQueue) {
+    dispatch_task(*node, item.stage_name, item.task_name, item.workdir, item.argv, {});
+    log_line(*node, "queue dispatched: " + item.stage_name + "/" + item.task_name + " => " + item.workdir);
+  } else {
+    dispatch_task(*node, item.stage_name, item.task_name, item.workdir, item.argv, {});
+    log_line(*node, "task dispatched: " + item.stage_name + "/" + item.task_name + " => " + shell_join(item.argv));
+  }
+  return true;
+}
+
+bool run_substage(ControllerState &state,
+                  const WorkflowSpec &workflow,
+                  const SubstageSpec &substage,
+                  const std::set<std::string> &allowed_endpoints) {
+  auto work_items = build_work_items(workflow, substage);
   std::deque<std::size_t> pending;
-  for (std::size_t i = 0; i < stage.tasks.size(); ++i) {
+  for (std::size_t i = 0; i < work_items.size(); ++i) {
     pending.push_back(i);
   }
 
   while (true) {
-    if (!wait_for_idle_node(state)) {
-      return;
+    if (state.stage_failed) {
+      return false;
     }
 
     std::shared_ptr<NodeSession> node;
-    std::size_t task_index = 0;
+    std::size_t item_index = pending.size();
     {
       std::lock_guard<std::mutex> lock(state.mutex);
-      node = pick_idle_node(state);
-      if (node && !pending.empty()) {
-        task_index = pending.front();
-        pending.pop_front();
-        node->busy = true;
-        node->current_stage = stage.name;
-        node->current_task = stage.tasks[task_index].name;
-        node->current_exit = -1;
-      } else {
-        node = nullptr;
-      }
-    }
-
-    if (node && task_index < stage.tasks.size()) {
-      const auto &task = stage.tasks[task_index];
-      send_task_payloads(*node, stage, task, task_index);
-      dispatch_task(*node, stage.name, task.name, task.workdir, task.argv, {});
-      log_line(*node, "task dispatched: " + stage.name + "/" + task.name + " => " + shell_join(task.argv));
-      continue;
-    }
-
-    std::unique_lock<std::mutex> lock(state.mutex);
-    if (pending.empty()) {
-      bool any_busy = false;
-      for (const auto &[name, n] : state.nodes) {
-        if (n->authenticated && n->connected && n->busy) {
-          any_busy = true;
+      for (std::size_t i = 0; i < pending.size(); ++i) {
+        const auto &item = work_items[pending[i]];
+        auto candidate = pick_idle_node(state,
+                                        allowed_endpoints.empty() ? nullptr : &allowed_endpoints,
+                                        item.agent_name);
+        if (candidate) {
+          item_index = i;
+          node = candidate;
+          node->busy = true;
+          node->current_stage = item.stage_name;
+          node->current_task = item.task_name;
+          node->current_exit = -1;
           break;
         }
       }
-      if (!any_busy) {
-        break;
+    }
+
+    if (node) {
+      auto pending_index = pending[item_index];
+      pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(item_index));
+      dispatch_work_item(substage, work_items[pending_index], node);
+      continue;
+    }
+
+    if (pending.empty()) {
+      if (!has_any_busy_node(state, allowed_endpoints.empty() ? nullptr : &allowed_endpoints)) {
+        return true;
       }
     }
+
+    std::unique_lock<std::mutex> lock(state.mutex);
     state.cv.wait(lock);
     if (state.stage_failed) {
-      return;
+      return false;
     }
   }
 }
 
-void run_queue_stage(ControllerState &state, const StageSpec &stage) {
-  auto files = stage.queue_files;
-  std::deque<std::filesystem::path> pending(files.begin(), files.end());
-  std::size_t job_index = 0;
-
-  while (true) {
-    {
-      std::lock_guard<std::mutex> lock(state.mutex);
-      if (pending.empty()) {
-        bool any_busy = false;
-        for (const auto &[name, n] : state.nodes) {
-          if (n->authenticated && n->connected && n->busy) {
-            any_busy = true;
-            break;
-          }
-        }
-        if (!any_busy) {
-          break;
-        }
+bool run_workflow(ControllerState &state, const WorkflowSpec &workflow, const std::set<std::string> &default_allowed) {
+  std::vector<std::thread> threads;
+  if (workflow.kind == WorkflowKind::kParallel) {
+    threads.reserve(workflow.substages.size());
+    for (const auto &substage : workflow.substages) {
+      AgentPoolSpec pool = substage.agent_pool;
+      auto resolved = resolve_agent_pool(pool);
+      auto allowed = endpoint_keys(resolved.empty() ? std::vector<AgentEndpoint>{} : resolved);
+      if (allowed.empty()) {
+        allowed = default_allowed;
+      }
+      threads.emplace_back([&state, &workflow, substage_ptr = &substage, allowed] {
+        (void)run_substage(state, workflow, *substage_ptr, allowed);
+      });
+    }
+    for (auto &thread : threads) {
+      if (thread.joinable()) {
+        thread.join();
       }
     }
+    return !state.stage_failed;
+  }
 
-    if (!wait_for_idle_node(state)) {
-      return;
+  for (const auto &substage : workflow.substages) {
+    AgentPoolSpec pool = substage.agent_pool;
+    auto resolved = resolve_agent_pool(pool);
+    auto allowed = endpoint_keys(resolved.empty() ? std::vector<AgentEndpoint>{} : resolved);
+    if (allowed.empty()) {
+      allowed = default_allowed;
     }
-
-    std::shared_ptr<NodeSession> node;
-    std::filesystem::path source_file;
-    {
-      std::lock_guard<std::mutex> lock(state.mutex);
-      node = pick_idle_node(state);
-      if (node && !pending.empty()) {
-        source_file = pending.front();
-        pending.pop_front();
-        std::string job_name = sanitize_name(stage.tasks[0].name + "-" + std::to_string(job_index) + "-" +
-                                             basename_string(source_file));
-        node->busy = true;
-        node->current_stage = stage.name;
-        node->current_task = job_name;
-        node->current_exit = -1;
-      } else {
-        node = nullptr;
-      }
-    }
-
-    if (node && !source_file.empty()) {
-      const auto &task = stage.tasks[0];
-      dispatch_queue_job(*node, stage.name, task, source_file, job_index);
-      log_line(*node, "queue dispatched: " + stage.name + "/" + task.name + " => " + source_file.string());
-      ++job_index;
-      continue;
-    }
-
-    std::unique_lock<std::mutex> lock(state.mutex);
-    if (pending.empty()) {
-      bool any_busy = false;
-      for (const auto &[name, n] : state.nodes) {
-        if (n->authenticated && n->connected && n->busy) {
-          any_busy = true;
-          break;
-        }
-      }
-      if (!any_busy) {
-        break;
-      }
-    }
-    state.cv.wait(lock);
-    if (state.stage_failed) {
-      return;
+    if (!run_substage(state, workflow, substage, allowed)) {
+      return false;
     }
   }
+  return true;
 }
 
 void agent_connector(ControllerState &state, AgentEndpoint endpoint, TlsConfig client_cfg) {
@@ -600,24 +711,18 @@ int main(int argc, char **argv) {
   state.controller_name = resolved_name;
   state.log_dir = resolved_log_dir;
 
-  std::vector<AgentEndpoint> resolved_endpoints = endpoints;
-  if (resolved_endpoints.empty()) {
-    std::optional<std::string> resolved_agents_file = agents_file;
-    if (!resolved_agents_file && plan.options.agents_file) {
-      resolved_agents_file = *plan.options.agents_file;
-    }
-    if (resolved_agents_file) {
-      resolved_endpoints = load_agents_file(*resolved_agents_file);
-    }
-  }
-  if (resolved_endpoints.empty()) {
-    for (const auto &endpoint_text : plan.options.agents) {
-      resolved_endpoints.push_back(parse_endpoint(endpoint_text));
-    }
-  }
+  AgentPoolSpec default_pool = resolve_default_pool(plan, agents_file, endpoints);
+  std::vector<AgentEndpoint> resolved_endpoints = collect_required_endpoints(plan, default_pool);
   if (resolved_endpoints.empty()) {
     std::cerr << "usage: rc --plan plan.txt [--no-cert | --cert client.crt --key client.key --ca ca.crt] [--agent host:port ...] [--agents-file file] [--token TOKEN] [--name rc] [--log-dir dir]\n";
     return 2;
+  }
+
+  std::set<std::string> default_allowed = endpoint_keys(resolve_agent_pool(default_pool));
+  if (default_allowed.empty()) {
+    for (const auto &endpoint : resolved_endpoints) {
+      default_allowed.insert(endpoint.host + ":" + std::to_string(endpoint.port));
+    }
   }
 
   TlsConfig client_cfg;
@@ -654,24 +759,18 @@ int main(int argc, char **argv) {
   std::cout << "\n";
   std::cout << "interactive commands: status | pause <node> | resume <node> | kill <node>\n";
 
-  for (const auto &stage : plan.stages) {
-    std::cout << "starting stage " << stage.name << "\n";
+  for (const auto &workflow : plan.workflows) {
+    std::cout << "starting workflow " << workflow.name << "\n";
     {
       std::lock_guard<std::mutex> lock(state.mutex);
       state.stage_failed = false;
     }
 
-    if (stage.has_queue_files) {
-      run_queue_stage(state, stage);
-    } else {
-      run_fixed_parallel_stage(state, stage);
-    }
-
-    if (state.stage_failed) {
-      std::cerr << "stage failed: " << stage.name << "\n";
+    if (!run_workflow(state, workflow, default_allowed) || state.stage_failed) {
+      std::cerr << "workflow failed: " << workflow.name << "\n";
       break;
     }
-    std::cout << "stage complete: " << stage.name << "\n";
+    std::cout << "workflow complete: " << workflow.name << "\n";
   }
 
   state.running = false;

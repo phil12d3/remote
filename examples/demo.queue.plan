@@ -6,13 +6,15 @@ option log-dir examples/logs-queue
 option cert examples/certs/server.crt
 option key examples/certs/server.key
 option ca examples/certs/ca.crt
-option agents-file examples/agents.local.txt
+option agents-file examples/agents.txt
 
-stage queue parallel
-task process -- /bin/sh -c "echo queue job: $1; wc -l \"$1\"; cat \"$1\"" sh
-queue file examples/data/queue/job-1.txt
-queue file examples/data/queue/job-2.txt
-queue file examples/data/queue/job-3.txt
-queue file examples/data/queue/job-4.txt
-queue file examples/data/queue/job-5.txt
+workflow queue-demo sequential
+  substage queue queue
+    task process -- /bin/sh -c "echo queue job: $1; wc -l \"$1\"; cat \"$1\"" sh
+    queue file examples/data/queue/job-1.txt
+    queue file examples/data/queue/job-2.txt
+    queue file examples/data/queue/job-3.txt
+    queue file examples/data/queue/job-4.txt
+    queue file examples/data/queue/job-5.txt
+  end
 end

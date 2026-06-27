@@ -14,13 +14,13 @@ What needs to be running:
 
 2. Start one or more agents on remote machines, or in separate terminals on the same machine:
 
-   ./bin/rc-agent --port 19001 --cert examples/certs/server.crt --key examples/certs/server.key --ca examples/certs/ca.crt --token secret --name node1
+   ./bin/rc-agent --port 29001 --cert examples/certs/server.crt --key examples/certs/server.key --ca examples/certs/ca.crt --token secret --name node1
 
-   If you want the parallel stage to use three workers on one machine, open three terminals and run:
+   If you want the queue and shard substages to have three workers on one machine, open three terminals and run:
 
-   ./bin/rc-agent --port 19001 --cert examples/certs/server.crt --key examples/certs/server.key --ca examples/certs/ca.crt --token secret --name node1
-   ./bin/rc-agent --port 19002 --cert examples/certs/server.crt --key examples/certs/server.key --ca examples/certs/ca.crt --token secret --name node2
-   ./bin/rc-agent --port 19003 --cert examples/certs/server.crt --key examples/certs/server.key --ca examples/certs/ca.crt --token secret --name node3
+   ./bin/rc-agent --port 29001 --cert examples/certs/server.crt --key examples/certs/server.key --ca examples/certs/ca.crt --token secret --name node1
+   ./bin/rc-agent --port 29002 --cert examples/certs/server.crt --key examples/certs/server.key --ca examples/certs/ca.crt --token secret --name node2
+   ./bin/rc-agent --port 29003 --cert examples/certs/server.crt --key examples/certs/server.key --ca examples/certs/ca.crt --token secret --name node3
 
    Each agent:
 
@@ -39,10 +39,9 @@ What needs to be running:
    - reads controller defaults from the plan
    - reads the agent list from examples/agents.txt through the plan
    - connects to the agents over TLS
-   - schedules stages in order
+   - schedules workflows in order
+   - runs substages in sequence or in parallel, depending on the workflow
    - writes logs into examples/logs
-
-   The split stage keeps whole rows together. The input file is split by lines, not by bytes.
 
    If you want a one-machine variant that uses higher localhost ports, use:
 
@@ -51,34 +50,37 @@ What needs to be running:
    ./bin/rc-agent --port 24003 --cert examples/certs/server.crt --key examples/certs/server.key --ca examples/certs/ca.crt --token secret --name node3
    ./bin/rc --agents-file examples/agents.local.txt --plan examples/demo.plan
 
-   If you want to see the queued-file mode, run:
+   If you want to see the queue-only example, run:
 
    ./bin/rc --plan examples/demo.queue.plan
 
    Dev-only plaintext mode, if you do not want to generate certs:
 
-   ./bin/rc-agent --no-cert --port 19001 --token secret --name node1
-   ./bin/rc-agent --no-cert --port 19002 --token secret --name node2
-   ./bin/rc-agent --no-cert --port 19003 --token secret --name node3
+   ./bin/rc-agent --no-cert --port 29001 --token secret --name node1
+   ./bin/rc-agent --no-cert --port 29002 --token secret --name node2
+   ./bin/rc-agent --no-cert --port 29003 --token secret --name node3
    ./bin/rc --no-cert --plan examples/demo.plan
 
 What this example does:
 
-1. Stage "prepare" runs one single task.
-   - It shows a normal one-node stage.
+1. Workflow "prepare" runs one single substage.
+   - It shows a normal one-node substage.
    - It also copies a shared file to that task's working directory as shared-note.txt.
 
-2. Stage "shard" runs three tasks in parallel.
+2. Workflow "process" runs two substages in parallel.
    - It demonstrates fan-out across multiple nodes.
-   - It splits examples/data/input.txt into three row-based pieces.
-   - Each task receives one shard named input.txt.part0, input.txt.part1, or input.txt.part2.
+   - The "shard" substage splits examples/data/input.txt into three row-based pieces.
+   - The "queue" substage sends one file at a time to whichever agent is free.
+   - Each shard task receives one shard named input.txt.part0, input.txt.part1, or input.txt.part2.
+   - Each queue job gets the next file from the queue list directly in the plan.
 
-3. Stage "finalize" runs one last single task.
-   - It shows that the controller only moves on after the parallel stage is complete.
+3. Workflow "finalize" runs one last single substage.
+   - It shows that the controller only moves on after the parallel workflow is complete.
 
-4. The queued-file example sends one file at a time to whichever agent is free.
-   - It lists the files one per line in examples/demo.queue.plan.
-   - When a worker finishes, it automatically receives the next file until the list is exhausted.
+4. Agent scoping and pinning.
+   - A workflow or substage can restrict itself to a named agent list with `agents-file` or inline `agent` lines.
+   - A task can be pinned to a specific agent with `task <name> agent <node> -- ...`.
+   - That lets you keep a general pool, narrow it for one substage, and still force one task onto a single node when needed.
 
 Notes:
 
@@ -88,11 +90,11 @@ Notes:
 - Each `rc-agent` needs its own free listening port. If you see `bind() failed`, pick a different port or stop the process already using it.
 - The controller stores per-node logs in the log directory you pass with --log-dir.
 - Commands can emit progress lines using ::progress::<percent>::<message>.
-- The split stage writes shards named input.txt.part0, input.txt.part1, and input.txt.part2.
+- The split workflow keeps whole rows together. The input file is split by lines, not by bytes.
 - Split stages preserve whole rows.
 - Queue stages append the uploaded filename to the task argv, so the task can open the file it just received.
 - Shared files are copied using their basename, so examples/data/shared-note.txt becomes shared-note.txt inside the task directory.
 - In cert mode, keep the controller and agents using the same CA and certificate/key files generated by `./examples/make-dev-certs.sh`.
-- You can update examples/agents.txt without touching the stage definitions.
+- You can update examples/agents.txt without touching the workflow definitions.
 - The local example uses `examples/agents.local.txt` with `examples/demo.plan`.
-- The queued-file example uses `examples/demo.queue.plan` and keeps the file list inline on separate lines.
+- The queue example uses `examples/demo.queue.plan`.

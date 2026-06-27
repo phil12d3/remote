@@ -8,18 +8,33 @@ option key examples/certs/server.key
 option ca examples/certs/ca.crt
 option agents-file examples/agents.txt
 
-stage prepare single
-task prepare -- /bin/sh -c "echo preparing remote batch; wc -c shared-note.txt"
-shared file examples/data/shared-note.txt
+workflow prepare sequential
+  substage prepare single
+    task prepare -- /bin/sh -c "echo preparing remote batch; wc -c shared-note.txt"
+    shared file examples/data/shared-note.txt
+  end
 end
 
-stage shard parallel
-task shard-a -- /bin/sh -c "echo shard A; wc -l input.txt.part0; cat input.txt.part0"
-task shard-b -- /bin/sh -c "echo shard B; wc -l input.txt.part1; cat input.txt.part1"
-task shard-c -- /bin/sh -c "echo shard C; wc -l input.txt.part2; cat input.txt.part2"
-split file examples/data/input.txt
+workflow process parallel
+  substage shard parallel
+    task shard-a -- /bin/sh -c "echo shard A; wc -l input.txt.part0; cat input.txt.part0"
+    task shard-b -- /bin/sh -c "echo shard B; wc -l input.txt.part1; cat input.txt.part1"
+    task shard-c -- /bin/sh -c "echo shard C; wc -l input.txt.part2; cat input.txt.part2"
+    split file examples/data/input.txt
+  end
+
+  substage queue queue
+    task process -- /bin/sh -c "echo queue job: $1; wc -l \"$1\"; cat \"$1\"" sh
+    queue file examples/data/queue/job-1.txt
+    queue file examples/data/queue/job-2.txt
+    queue file examples/data/queue/job-3.txt
+    queue file examples/data/queue/job-4.txt
+    queue file examples/data/queue/job-5.txt
+  end
 end
 
-stage finalize single
-task finalize -- /bin/sh -c "echo all remote work finished"
+workflow finalize sequential
+  substage finalize single
+    task finalize -- /bin/sh -c "echo all remote work finished"
+  end
 end
